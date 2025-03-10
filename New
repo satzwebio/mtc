@@ -1,0 +1,155 @@
+ansible-mtc-migration/
+│── roles/
+│   ├── mtc_migration/
+│   │   ├── tasks/
+│   │   │   ├── check_login.yml
+│   │   │   ├── check_migplan.yml
+│   │   │   ├── delete_old_migmigration.yml
+│   │   │   ├── create_migmigration.yml
+│   │   │   ├── monitor_migmigration.yml
+│   │   │   ├── notify_user.yml
+│   │   ├── templates/
+│   │   │   ├── email_template.j2
+│   │   │   ├── migration_backup.j2
+│── playbook.yml
+│── inventory
+│── group_vars/
+│── README.md
+
+- name: MTC Migration Automation
+  hosts: localhost
+  gather_facts: no
+  vars:
+    mtc_cluster_url: "{{ mtcclusterurl }}"  # User input
+    mig_plan_name: "{{ migplan }}"
+    mig_secret_name: "{{ secret_name }}"
+    user_email: "{{ email }}"
+    kubeconfig_path: "/tmp/kubeconfig"
+
+  roles:
+    - role: mtc_migration
+
+
+
+- name: Check login to MTC Cluster
+  command: "oc login {{ mtc_cluster_url }} --token=$(oc whoami -t) --kubeconfig={{ kubeconfig_path }}"
+  register: login_result
+  failed_when: login_result.rc != 0
+  ignore_errors: yes
+
+- name: Fail if login unsuccessful
+  fail:
+    msg: "Unable to login to MTC Cluster {{ mtc_cluster_url }}. Check credentials!"
+  when: login_result.failed
+
+
+
+
+
+- name: Check if MigPlan exists
+  command: "oc get migplan {{ mig_plan_name }} -o jsonpath='{.metadata.name}' --kubeconfig={{ kubeconfig_path }}"
+  register: migplan_check
+  failed_when: migplan_check.rc != 0
+  ignore_errors: yes
+
+- name: Fail if MigPlan does not exist
+  fail:
+    msg: "MigPlan {{ mig_plan_name }} not found in MTC Cluster!"
+  when: migplan_check.failed
+
+
+
+
+- name: Check if MigMigration exists
+  command: "oc get migmigration -o jsonpath='{.items[?(@.spec.migPlanRef.name==\"{{ mig_plan_name }}\")].metadata.name}' --kubeconfig={{ kubeconfig_path }}"
+  register: existing_migmigration
+  changed_when: false
+
+- name: Backup old MigMigration details
+  template:
+    src: migration_backup.j2
+    dest: "/tmp/migmigration_backup_{{ ansible_date_time.epoch }}.yaml"
+  when: existing_migmigration.stdout != ""
+
+- name: Delete old MigMigration if exists
+  command: "oc delete migmigration {{ existing_migmigration.stdout }} --kubeconfig={{ kubeconfig_path }}"
+  when: existing_migmigration.stdout != ""
+
+
+- name: Create new MigMigration
+  command: >
+    oc apply -f - --kubeconfig={{ kubeconfig_path }}
+  args:
+    stdin: |
+      apiVersion: migration.openshift.io/v1alpha1
+      kind: MigMigration
+      metadata:
+        name: migmigration-{{ mig_plan_name }}-{{ ansible_date_time.epoch }}
+        namespace: openshift-migration
+      spec:
+        migPlanRef:
+          name: "{{ mig_plan_name }}"
+          namespace: openshift-migration
+        stage: false
+        rollback: false
+  register: create_result
+  failed_when: create_result.rc != 0
+
+
+- name: Monitor MigMigration status
+  command: >
+    oc get migmigration -o jsonpath='{.items[?(@.spec.migPlanRef.name=="{{ mig_plan_name }}")].status.conditions[*].type}' --kubeconfig={{ kubeconfig_path }}
+  register: migmigration_status
+  retries: 30
+  delay: 10
+  until: "'Succeeded' in migmigration_status.stdout or 'Failed' in migmigration_status.stdout"
+
+- name: Fail if migration failed
+  fail:
+    msg: "Migration failed! Please check logs."
+  when: "'Failed' in migmigration_status.stdout"
+
+
+- name: Send email notification
+  mail:
+    host: smtp.yourcompany.com
+    port: 587
+    username: "no-reply@yourcompany.com"
+    password: "your_password"
+    to: "{{ user_email }}"
+    subject: "MTC Migration Status - {{ mig_plan_name }}"
+    body: "{{ lookup('template', 'email_template.j2') }}"
+    subtype: html
+
+
+<html>
+<body>
+<h2>MTC Migration Status</h2>
+<p><strong>Cluster:</strong> {{ mtc_cluster_url }}</p>
+<p><strong>MigPlan:</strong> {{ mig_plan_name }}</p>
+<p><strong>Status:</strong> {% if 'Succeeded' in migmigration_status.stdout %}✔ Success{% else %}❌ Failed{% endif %}</p>
+<p>Check OpenShift migration logs for details.</p>
+</body>
+</html>
+
+
+# Backup of old MigMigration
+apiVersion: migration.openshift.io/v1alpha1
+kind: MigMigration
+metadata:
+  name: {{ existing_migmigration.stdout }}
+  namespace: openshift-migration
+spec:
+  migPlanRef:
+    name: "{{ mig_plan_name }}"
+    namespace: openshift-migration
+
+
+
+mtcclusterurl: "https://your-openshift-cluster-url"
+migplan: "your-migplan-name"
+secret_name: "your-openshift-secret"
+email: "user@example.com"
+
+
+
