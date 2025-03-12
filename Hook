@@ -1,0 +1,16 @@
+spec:
+  hooks:
+    - executionNamespace: openshift-migration
+      targetCluster: source
+      activeDeadlineSeconds: 60
+      hookType: PreBackup
+      image: "registry.redhat.io/openshift4/ose-cli"
+      serviceAccount: migration-sa
+      custom:
+        command:
+          - "/bin/bash"
+          - "-c"
+          - |
+            echo "Flushing Postgres WAL files and dirty pages"
+            oc exec -it -n my-namespace $(oc get pod -n my-namespace -l app=postgres -o jsonpath='{.items[0].metadata.name}') -- \
+            bash -c "psql -U postgres -c 'SELECT pg_switch_wal(); CHECKPOINT;'"
